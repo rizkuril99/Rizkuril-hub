@@ -1,0 +1,1705 @@
+--// RIZKURIL BUNDLE ANIMATIONS v3
+--// Fitur: katalog marketplace otomatis (HTTP + AvatarEditorService), auto-load semua halaman,
+--//        hide (tombol bisa diganti + bubble), hotkey bundle/emote, RECENT, FAVS, NEW (item baru),
+--//        filter gratis, cache, thumbnail lazy-load, simpan semua pengaturan.
+--// Tes di game buatan sendiri / Roblox Studio (karakter R15)
+
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local AssetService = game:GetService("AssetService")
+local InsertService = game:GetService("InsertService")
+local AvatarEditorService = game:GetService("AvatarEditorService")
+
+local Player = Players.LocalPlayer
+local alive = true
+
+--------------------------------------------------------------------
+-- CONFIG
+--------------------------------------------------------------------
+local CATALOG_HOSTS = {
+    "https://catalog.roblox.com",
+    "https://catalog.roproxy.com", -- cadangan (proxy pihak ketiga); hapus baris ini kalau tidak mau dipakai
+}
+local CATALOG_PATH = "/v1/search/items/details"
+local BUNDLE_QUERY = "Category=12&Subcategory=20" -- Avatar Animation > Bundles
+local EMOTE_QUERY = "Category=12&Subcategory=39"  -- Avatar Animation > Emotes
+local MAX_AUTO_PAGES = 80
+local MAX_RECENT = 40
+local SETTINGS_FILE = "RizKurilBundleSettings.json"
+local OLD_FAV_FILE = "RizKurilBundleFavs.json"
+
+local SORTS = {
+    { "Relevansi", 0 }, { "Terfavorit", 1 }, { "Terlaris", 2 },
+    { "Terbaru", 3 }, { "Harga ↑", 4 }, { "Harga ↓", 5 },
+}
+local NEWEST_SORT = 4 -- index "Terbaru" di SORTS
+local AE_SORT_NAMES = { "Relevance", "MostFavorited", "Bestselling", "RecentlyCreated", "PriceLowToHigh", "PriceHighToLow" }
+local PAGES = { 30, 60, 120 }
+local REFRESH_MINUTES = { 2, 5, 10, 30 }
+
+--------------------------------------------------------------------
+-- UTIL
+--------------------------------------------------------------------
+local function GetGuiParent()
+    local ok, core = pcall(function() return game:GetService("CoreGui") end)
+    if ok and core then
+        local t_ok = pcall(function()
+            local t = Instance.new("Folder")
+            t.Parent = core
+            t:Destroy()
+        end)
+        if t_ok then return core end
+    end
+    return Player:WaitForChild("PlayerGui")
+end
+
+local GuiParent = GetGuiParent()
+pcall(function()
+    local old = GuiParent:FindFirstChild("RizKurilBundleAnim")
+    if old then old:Destroy() end
+end)
+
+local function Create(class, props, parent)
+    local obj = Instance.new(class)
+    for k, v in pairs(props) do obj[k] = v end
+    obj.Parent = parent
+    return obj
+end
+
+local Connections = {}
+local function Track(c) table.insert(Connections, c) return c end
+
+local Theme = {
+    Background = Color3.fromRGB(17, 17, 19),
+    Panel = Color3.fromRGB(28, 28, 31),
+    Element = Color3.fromRGB(36, 36, 40),
+    White = Color3.fromRGB(245, 245, 245),
+    Text = Color3.fromRGB(240, 240, 240),
+    Muted = Color3.fromRGB(125, 125, 132),
+    Dark = Color3.fromRGB(15, 15, 17),
+    Gold = Color3.fromRGB(255, 205, 80),
+    Red = Color3.fromRGB(235, 80, 80),
+}
+
+local httpRequest = (syn and syn.request) or (http and http.request) or http_request or request
+local clipboardFn = setclipboard or toclipboard or (syn and syn.write_clipboard)
+
+local function HttpGetJsonUrl(url)
+    local ok, body = pcall(function()
+        if httpRequest then
+            return httpRequest({ Url = url, Method = "GET" }).Body
+        end
+        return HttpService:GetAsync(url)
+    end)
+    if not ok or type(body) ~= "string" then return nil end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
+    return ok2 and data or nil
+end
+
+-- coba semua host, retry (rate limit dsb)
+local function CatalogGet(pathAndQuery)
+    for attempt = 1, 3 do
+        for _, host in ipairs(CATALOG_HOSTS) do
+            local data = HttpGetJsonUrl(host .. pathAndQuery)
+            if data and data.data then return data end
+        end
+        if attempt < 3 then task.wait(1.5 * attempt) end
+    end
+    return nil
+end
+
+local function Viewport()
+    local cam = workspace.CurrentCamera
+    return cam and cam.ViewportSize or Vector2.new(1280, 720)
+end
+
+--------------------------------------------------------------------
+-- SETTINGS (disimpan kalau executor punya writefile)
+--------------------------------------------------------------------
+local Settings = {
+    hideKey = "RightShift",
+    loop = false,
+    stopOnMove = true,
+    speed = 1,
+    sort = 1,
+    page = 3,
+    autoAll = false,
+    bubble = true,
+    freeOnly = false,
+    autoCheck = true,
+    refresh = 2,
+    favs = {},
+    recent = {},
+    binds = {},
+    newItems = {},
+    latest = {},
+    win = nil,
+    bubblePos = nil,
+}
+
+pcall(function()
+    if readfile and isfile and isfile(SETTINGS_FILE) then
+        local d = HttpService:JSONDecode(readfile(SETTINGS_FILE))
+        if type(d) == "table" then
+            for k, v in pairs(d) do Settings[k] = v end
+        end
+    elseif readfile and isfile and isfile(OLD_FAV_FILE) then
+        local d = HttpService:JSONDecode(readfile(OLD_FAV_FILE))
+        if type(d) == "table" then Settings.favs = d end
+    end
+end)
+for _, k in ipairs({ "favs", "recent", "binds", "newItems", "latest" }) do
+    if type(Settings[k]) ~= "table" then Settings[k] = {} end
+end
+Settings.sort = math.clamp(tonumber(Settings.sort) or 1, 1, #SORTS)
+Settings.page = math.clamp(tonumber(Settings.page) or 3, 1, #PAGES)
+Settings.refresh = math.clamp(tonumber(Settings.refresh) or 2, 1, #REFRESH_MINUTES)
+Settings.speed = math.clamp(tonumber(Settings.speed) or 1, 0.1, 5)
+
+local function SaveSettings()
+    if writefile then
+        pcall(function() writefile(SETTINGS_FILE, HttpService:JSONEncode(Settings)) end)
+    end
+end
+
+local function GetHideKey()
+    local ok, k = pcall(function() return Enum.KeyCode[Settings.hideKey] end)
+    return (ok and k) or Enum.KeyCode.RightShift
+end
+
+--------------------------------------------------------------------
+-- WINDOW
+--------------------------------------------------------------------
+local MIN_W, MIN_H = 600, 440
+
+local Gui = Create("ScreenGui", {
+    Name = "RizKurilBundleAnim",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+}, GuiParent)
+
+local startSize = Vector2.new(640, 560)
+local startPos = UDim2.new(0.5, -320, 0.5, -280)
+if type(Settings.win) == "table" then
+    local vp = Viewport()
+    local w = math.max(MIN_W, tonumber(Settings.win.w) or startSize.X)
+    local h = math.max(MIN_H, tonumber(Settings.win.h) or startSize.Y)
+    local x = math.clamp(tonumber(Settings.win.x) or 0, 0, math.max(0, vp.X - 120))
+    local y = math.clamp(tonumber(Settings.win.y) or 0, 0, math.max(0, vp.Y - 60))
+    startSize = Vector2.new(w, h)
+    startPos = UDim2.fromOffset(x, y)
+end
+
+local Main = Create("Frame", {
+    Size = UDim2.fromOffset(startSize.X, startSize.Y),
+    Position = startPos,
+    BackgroundColor3 = Theme.Background,
+    BorderSizePixel = 0,
+    ClipsDescendants = true
+}, Gui)
+Create("UICorner", { CornerRadius = UDim.new(0, 10) }, Main)
+Create("UIStroke", { Color = Color3.fromRGB(45, 45, 50), Thickness = 1 }, Main)
+
+local function SaveWin()
+    Settings.win = {
+        w = Main.AbsoluteSize.X, h = Main.AbsoluteSize.Y,
+        x = Main.AbsolutePosition.X, y = Main.AbsolutePosition.Y,
+    }
+    SaveSettings()
+end
+
+local Header = Create("Frame", {
+    Size = UDim2.new(1, 0, 0, 44),
+    BackgroundColor3 = Color3.fromRGB(21, 21, 24),
+    BorderSizePixel = 0
+}, Main)
+
+local Logo = Create("Frame", {
+    Position = UDim2.fromOffset(14, 11),
+    Size = UDim2.fromOffset(22, 22),
+    BackgroundColor3 = Theme.White,
+    BorderSizePixel = 0
+}, Header)
+Create("UICorner", { CornerRadius = UDim.new(0, 5) }, Logo)
+Create("TextLabel", {
+    Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+    Text = "▸", TextColor3 = Theme.Background,
+    Font = Enum.Font.GothamBold, TextSize = 10
+}, Logo)
+
+Create("TextLabel", {
+    Position = UDim2.fromOffset(46, 0),
+    Size = UDim2.new(1, -120, 1, 0),
+    BackgroundTransparency = 1,
+    Text = "BUNDLE ANIMATIONS",
+    TextColor3 = Theme.Text,
+    Font = Enum.Font.GothamBold,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, Header)
+
+local CloseBtn = Create("TextButton", {
+    Position = UDim2.new(1, -38, 0, 8),
+    Size = UDim2.fromOffset(26, 28),
+    BackgroundColor3 = Theme.Element,
+    Text = "X", TextColor3 = Theme.Text,
+    Font = Enum.Font.GothamBold, TextSize = 11,
+    AutoButtonColor = false
+}, Header)
+Create("UICorner", { CornerRadius = UDim.new(0, 5) }, CloseBtn)
+
+local HideBtn = Create("TextButton", {
+    Position = UDim2.new(1, -70, 0, 8),
+    Size = UDim2.fromOffset(26, 28),
+    BackgroundColor3 = Theme.Element,
+    Text = "—", TextColor3 = Theme.Text,
+    Font = Enum.Font.GothamBold, TextSize = 12,
+    AutoButtonColor = false
+}, Header)
+Create("UICorner", { CornerRadius = UDim.new(0, 5) }, HideBtn)
+
+local Content = Create("Frame", {
+    Position = UDim2.fromOffset(14, 56),
+    Size = UDim2.new(1, -28, 1, -88),
+    BackgroundTransparency = 1
+}, Main)
+
+local Footer = Create("TextLabel", {
+    Position = UDim2.new(0, 14, 1, -26),
+    Size = UDim2.new(1, -50, 0, 18),
+    BackgroundTransparency = 1,
+    Text = "",
+    TextColor3 = Theme.Muted,
+    Font = Enum.Font.Gotham,
+    TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left
+}, Main)
+
+--------------------------------------------------------------------
+-- DRAG & RESIZE
+--------------------------------------------------------------------
+-- onClick dipanggil kalau tidak digeser (bubble); onEnd dipanggil setelah drag selesai
+local function MakeDraggable(handle, target, onClick, onEnd)
+    local dragging, dragStart, startPosV, moved = false, nil, nil, false
+    Track(handle.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            moved = false
+            dragStart = i.Position
+            startPosV = target.Position
+        end
+    end))
+    Track(UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            if d.Magnitude > 4 then moved = true end
+            target.Position = UDim2.new(startPosV.X.Scale, startPosV.X.Offset + d.X, startPosV.Y.Scale, startPosV.Y.Offset + d.Y)
+        end
+    end))
+    Track(UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            if dragging then
+                if not moved and onClick then onClick() end
+                if moved and onEnd then onEnd() end
+            end
+            dragging = false
+        end
+    end))
+end
+MakeDraggable(Header, Main, nil, SaveWin)
+
+local ResizeBtn = Create("TextButton", {
+    Position = UDim2.new(1, -20, 1, -20),
+    Size = UDim2.fromOffset(18, 18),
+    BackgroundTransparency = 1,
+    Text = "◢", TextColor3 = Theme.Muted,
+    Font = Enum.Font.Gotham, TextSize = 12,
+    ZIndex = 30
+}, Main)
+
+do
+    local resizing, startMouse, startSz = false, nil, nil
+    Track(ResizeBtn.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            resizing = true
+            startMouse = i.Position
+            startSz = Main.AbsoluteSize
+        end
+    end))
+    Track(UIS.InputChanged:Connect(function(i)
+        if resizing and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - startMouse
+            Main.Size = UDim2.fromOffset(
+                math.max(MIN_W, startSz.X + d.X),
+                math.max(MIN_H, startSz.Y + d.Y)
+            )
+        end
+    end))
+    Track(UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            if resizing then SaveWin() end
+            resizing = false
+        end
+    end))
+end
+
+--------------------------------------------------------------------
+-- BUBBLE (ikon kecil untuk membuka GUI lagi)
+--------------------------------------------------------------------
+local Bubble = Create("TextButton", {
+    Position = UDim2.fromOffset(20, 200),
+    Size = UDim2.fromOffset(42, 42),
+    BackgroundColor3 = Theme.White,
+    Text = "RK", TextColor3 = Theme.Dark,
+    Font = Enum.Font.GothamBold, TextSize = 13,
+    AutoButtonColor = false,
+    Visible = false, ZIndex = 50
+}, Gui)
+Create("UICorner", { CornerRadius = UDim.new(1, 0) }, Bubble)
+Create("UIStroke", { Color = Color3.fromRGB(45, 45, 50), Thickness = 2 }, Bubble)
+local BubbleDot = Create("Frame", {
+    Position = UDim2.fromOffset(30, 0), Size = UDim2.fromOffset(12, 12),
+    BackgroundColor3 = Theme.Red, BorderSizePixel = 0,
+    Visible = false, ZIndex = 51
+}, Bubble)
+Create("UICorner", { CornerRadius = UDim.new(1, 0) }, BubbleDot)
+
+if type(Settings.bubblePos) == "table" then
+    local vp = Viewport()
+    Bubble.Position = UDim2.fromOffset(
+        math.clamp(tonumber(Settings.bubblePos.x) or 20, 0, math.max(0, vp.X - 50)),
+        math.clamp(tonumber(Settings.bubblePos.y) or 200, 0, math.max(0, vp.Y - 50)))
+end
+
+--------------------------------------------------------------------
+-- UI BUILDERS
+--------------------------------------------------------------------
+local function Pill(parent, props, radius)
+    local b = Create("TextButton", props, parent)
+    b.AutoButtonColor = false
+    Create("UICorner", { CornerRadius = UDim.new(0, radius or 6) }, b)
+    return b
+end
+
+-- Search row
+local SearchBox = Create("TextBox", {
+    Size = UDim2.new(1, -112, 0, 36),
+    BackgroundColor3 = Theme.Panel,
+    Text = "", PlaceholderText = "Search animation packs — ninja, zombie...",
+    PlaceholderColor3 = Theme.Muted, TextColor3 = Theme.Text,
+    Font = Enum.Font.Gotham, TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ClearTextOnFocus = false
+}, Content)
+Create("UICorner", { CornerRadius = UDim.new(0, 6) }, SearchBox)
+Create("UIPadding", { PaddingLeft = UDim.new(0, 12) }, SearchBox)
+
+local SearchBtn = Pill(Content, {
+    Position = UDim2.new(1, -100, 0, 0), Size = UDim2.fromOffset(100, 36),
+    BackgroundColor3 = Theme.White, Text = "SEARCH",
+    TextColor3 = Theme.Dark, Font = Enum.Font.GothamBold, TextSize = 10
+})
+
+-- ID row
+local IdBox = Create("TextBox", {
+    Position = UDim2.fromOffset(0, 46),
+    Size = UDim2.new(1, -112, 0, 36),
+    BackgroundColor3 = Theme.Panel,
+    Text = "", PlaceholderText = "Paste bundle/emote ID atau link roblox.com/bundles/...",
+    PlaceholderColor3 = Theme.Muted, TextColor3 = Theme.Text,
+    Font = Enum.Font.Gotham, TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    ClearTextOnFocus = false
+}, Content)
+Create("UICorner", { CornerRadius = UDim.new(0, 6) }, IdBox)
+Create("UIPadding", { PaddingLeft = UDim.new(0, 12) }, IdBox)
+
+local ApplyBtn = Pill(Content, {
+    Position = UDim2.new(1, -100, 0, 46), Size = UDim2.fromOffset(100, 36),
+    BackgroundColor3 = Theme.Element, Text = "APPLY",
+    TextColor3 = Theme.Text, Font = Enum.Font.GothamBold, TextSize = 10
+})
+
+-- Tab rows
+local function MakeRow(y)
+    local row = Create("Frame", {
+        Position = UDim2.fromOffset(0, y),
+        Size = UDim2.new(1, 0, 0, 30),
+        BackgroundTransparency = 1
+    }, Content)
+    Create("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder
+    }, row)
+    return row
+end
+local TabRow1 = MakeRow(92)
+local TabRow2 = MakeRow(128)
+
+local function MakeTab(row, name, width, order)
+    return Pill(row, {
+        Size = UDim2.new(0, width, 1, 0),
+        BackgroundColor3 = Theme.Element,
+        Text = name, TextColor3 = Theme.Text,
+        Font = Enum.Font.GothamBold, TextSize = 10,
+        LayoutOrder = order
+    })
+end
+
+local TabButtons = {}
+TabButtons.bundles = MakeTab(TabRow1, "BUNDLES", 96, 1)
+TabButtons.emotes = MakeTab(TabRow1, "EMOTES", 96, 2)
+TabButtons.mix = MakeTab(TabRow1, "MIX", 80, 3)
+local GearBtn = MakeTab(TabRow1, "⚙", 36, 4)
+
+TabButtons.favs = MakeTab(TabRow2, "★ FAVS", 86, 1)
+TabButtons.recent = MakeTab(TabRow2, "RECENT", 86, 2)
+TabButtons.new = MakeTab(TabRow2, "NEW", 86, 3)
+TabButtons.keys = MakeTab(TabRow2, "⌨ KEYS", 86, 4)
+local StopBtn = MakeTab(TabRow2, "STOP", 70, 5)
+local ResetBtn = MakeTab(TabRow2, "RESET", 74, 6)
+
+local mode = "bundles" -- bundles | emotes | mix | favs | recent | new | keys
+local LIST_MODES = { favs = true, recent = true, new = true, keys = true }
+
+-- MIX chips
+local Chips = Create("Frame", {
+    Position = UDim2.fromOffset(0, 164),
+    Size = UDim2.new(1, 0, 0, 26),
+    BackgroundTransparency = 1,
+    Visible = false
+}, Content)
+Create("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 4),
+    SortOrder = Enum.SortOrder.LayoutOrder
+}, Chips)
+
+local slotsOn = {}
+local slotNames = { "idle", "walk", "run", "jump", "fall", "climb", "swim" }
+for i, s in ipairs(slotNames) do
+    slotsOn[s] = true
+    local chip = Pill(Chips, {
+        Size = UDim2.fromOffset(56, 26),
+        BackgroundColor3 = Theme.White,
+        Text = string.upper(s), TextColor3 = Theme.Dark,
+        Font = Enum.Font.GothamBold, TextSize = 9,
+        LayoutOrder = i
+    }, 13)
+    chip.MouseButton1Click:Connect(function()
+        slotsOn[s] = not slotsOn[s]
+        chip.BackgroundColor3 = slotsOn[s] and Theme.White or Theme.Element
+        chip.TextColor3 = slotsOn[s] and Theme.Dark or Theme.Muted
+    end)
+end
+
+-- Grid
+local Grid = Create("ScrollingFrame", {
+    Position = UDim2.fromOffset(0, 166),
+    Size = UDim2.new(1, 0, 1, -166),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = Theme.Muted,
+    CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y
+}, Content)
+local GridLayout = Create("UIGridLayout", {
+    CellPadding = UDim2.fromOffset(8, 8),
+    CellSize = UDim2.new(1 / 3, -8, 0, 158),
+    SortOrder = Enum.SortOrder.LayoutOrder
+}, Grid)
+Create("UIPadding", { PaddingRight = UDim.new(0, 6) }, Grid)
+
+local function UpdateCells()
+    local w = Grid.AbsoluteSize.X - 6
+    local cols = math.max(2, math.floor(w / 175))
+    GridLayout.CellSize = UDim2.new(1 / cols, -8, 0, 158)
+end
+UpdateCells()
+
+--------------------------------------------------------------------
+-- STATE
+--------------------------------------------------------------------
+local cursor, loading, count = nil, false, 0
+local orderCounter = 0
+local statusToken = 0
+local fetchGen = 0
+local pageCount = 0
+local seen = {}
+local source = "http" -- "http" | "ae" (sumber katalog grid saat ini)
+local gridAE = {}
+local lastQueryKey = nil
+local searchToken = 0
+
+local Fetch, ShowList, CheckNew, QueueThumbs -- forward declarations
+
+local function CountTable(t)
+    local n = 0
+    for _ in pairs(t) do n += 1 end
+    return n
+end
+
+local function UpdateFooter()
+    local hint = "  ·  hide: " .. GetHideKey().Name
+    if mode == "favs" then
+        Footer.Text = "Favorites: " .. CountTable(Settings.favs) .. hint
+    elseif mode == "recent" then
+        Footer.Text = "Recent: " .. #Settings.recent .. hint
+    elseif mode == "new" then
+        Footer.Text = "Item baru: " .. CountTable(Settings.newItems) .. "  ·  klik item untuk tandai dilihat" .. hint
+    elseif mode == "keys" then
+        Footer.Text = "Hotkey: " .. CountTable(Settings.binds) .. "  ·  tekan tombolnya kapan saja (GUI boleh disembunyikan)" .. hint
+    else
+        local label = (mode == "emotes") and "Emotes" or "Bundles"
+        Footer.Text = label .. " loaded: " .. count .. (cursor and "  ·  scroll untuk lainnya" or "") .. hint
+    end
+end
+
+local function SetStatus(text)
+    statusToken += 1
+    local my = statusToken
+    Footer.Text = text
+    task.delay(3.5, function()
+        if my == statusToken and Footer.Parent then UpdateFooter() end
+    end)
+end
+
+local function RefreshNewBadge()
+    local n = CountTable(Settings.newItems)
+    TabButtons.new.Text = (n > 0) and ("NEW (" .. n .. ")") or "NEW"
+    BubbleDot.Visible = n > 0
+end
+RefreshNewBadge()
+
+local function AddRecent(id, name, kind)
+    for i = #Settings.recent, 1, -1 do
+        local r = Settings.recent[i]
+        if r.id == id and r.kind == kind then table.remove(Settings.recent, i) end
+    end
+    table.insert(Settings.recent, 1, { id = id, name = name or (kind .. " " .. id), kind = kind })
+    while #Settings.recent > MAX_RECENT do table.remove(Settings.recent) end
+    SaveSettings()
+end
+
+--------------------------------------------------------------------
+-- HIDE / SHOW
+--------------------------------------------------------------------
+local GearPanel -- forward
+
+local function SetHidden(h)
+    Main.Visible = not h
+    Bubble.Visible = h and Settings.bubble
+    if GearPanel then GearPanel.Visible = false end
+    if not h then QueueThumbs() end
+end
+
+local function ToggleHidden()
+    SetHidden(Main.Visible)
+end
+
+HideBtn.MouseButton1Click:Connect(function() SetHidden(true) end)
+MakeDraggable(Bubble, Bubble, function() SetHidden(false) end, function()
+    Settings.bubblePos = { x = Bubble.AbsolutePosition.X, y = Bubble.AbsolutePosition.Y }
+    SaveSettings()
+end)
+
+--------------------------------------------------------------------
+-- ANIMASI: LOAD, APPLY BUNDLE, EMOTE
+--------------------------------------------------------------------
+local function GetChar()
+    local c = Player.Character
+    return c, c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function GetAnimator()
+    local _, hum = GetChar()
+    if not hum then return nil end
+    return hum:FindFirstChildOfClass("Animator") or Create("Animator", {}, hum)
+end
+
+local function IsR6()
+    local _, hum = GetChar()
+    return hum and hum.RigType == Enum.HumanoidRigType.R6
+end
+
+local function LoadAsset(id)
+    local ok, res = pcall(function() return game:GetObjects("rbxassetid://" .. id) end)
+    if ok and res and res[1] then return res[1] end
+    local ok2, m = pcall(function() return InsertService:LoadAsset(id) end)
+    if ok2 and m then return m end
+    return nil
+end
+
+local function CollectAnimations(root)
+    local list = {}
+    if root:IsA("Animation") then table.insert(list, root) end
+    for _, d in ipairs(root:GetDescendants()) do
+        if d:IsA("Animation") then table.insert(list, d) end
+    end
+    return list
+end
+
+local function FindCI(parent, name)
+    local lname = string.lower(name or "")
+    for _, c in ipairs(parent:GetChildren()) do
+        if string.lower(c.Name) == lname then return c end
+    end
+    return nil
+end
+
+local function SlotKey(folderName)
+    local f = string.lower(folderName or "")
+    if string.find(f, "^swim") then return "swim" end
+    return f
+end
+
+local function CopyTable(t)
+    local c = {}
+    for k, v in pairs(t) do c[k] = v end
+    return c
+end
+
+local originals = nil
+local function Snapshot(animate)
+    if originals then return end
+    originals = {}
+    for _, d in ipairs(animate:GetDescendants()) do
+        if d:IsA("Animation") then originals[d] = d.AnimationId end
+    end
+end
+
+local function RefreshAnimate(animate)
+    local animator = GetAnimator()
+    if animator then
+        for _, t in ipairs(animator:GetPlayingAnimationTracks()) do t:Stop(0.1) end
+    end
+    animate.Disabled = true
+    task.wait()
+    animate.Disabled = false
+end
+
+-- cache: tidak perlu download ulang bundle / emote yang sudah pernah dipakai
+local bundleCache = {} -- id -> { name, anims = { {folder, name, aid} } }
+local emoteCache = {}  -- id -> AnimationId string
+
+local function GetBundleEntry(id)
+    if bundleCache[id] then return bundleCache[id] end
+    local ok, details = pcall(function() return AssetService:GetBundleDetailsAsync(id) end)
+    if not ok or not details or not details.Items then return nil, "detail" end
+
+    local anims = {}
+    for _, it in ipairs(details.Items) do
+        if it.Type == "Asset" then
+            local obj = LoadAsset(it.Id)
+            if obj then
+                for _, a in ipairs(CollectAnimations(obj)) do
+                    table.insert(anims, {
+                        folder = a.Parent and a.Parent.Name,
+                        name = a.Name,
+                        aid = a.AnimationId,
+                    })
+                end
+                pcall(function() obj:Destroy() end)
+            end
+        end
+    end
+    if #anims == 0 then return nil, "empty" end
+
+    local entry = { name = details.Name, anims = anims }
+    bundleCache[id] = entry
+    return entry
+end
+
+local appliedList = {} -- urutan bundle yang sedang dipakai (dipasang ulang saat respawn)
+local applyBusy = false
+
+-- return ok, pesan
+local function ApplyBundleSync(id, name, silent, filter)
+    if IsR6() then return false, "R6 tidak didukung (bundle ini untuk R15)" end
+
+    local char = GetChar()
+    local animate = char and char:FindFirstChild("Animate")
+    if not animate then return false, "Script Animate tidak ditemukan (R15 saja)" end
+
+    if not silent then SetStatus("Memuat bundle " .. tostring(name or id) .. "...") end
+
+    local entry, why = GetBundleEntry(id)
+    if not entry then
+        return false, (why == "empty") and "Bundle tidak berisi animasi / gagal load" or ("Gagal ambil detail bundle " .. tostring(id))
+    end
+
+    Snapshot(animate)
+
+    local changed = 0
+    for _, a in ipairs(entry.anims) do
+        local key = SlotKey(a.folder)
+        if (not filter) or filter[key] then
+            local folder = a.folder and FindCI(animate, a.folder)
+            local target = folder and FindCI(folder, a.name)
+            if target and target:IsA("Animation") then
+                target.AnimationId = a.aid
+                changed += 1
+            end
+        end
+    end
+
+    if changed == 0 then return false, "Tidak ada slot yang cocok di Animate" end
+
+    RefreshAnimate(animate)
+
+    local shownName = name or entry.name
+    if not filter then
+        appliedList = { { id = id, name = shownName } }
+    else
+        table.insert(appliedList, { id = id, name = shownName, filter = filter })
+        while #appliedList > 20 do table.remove(appliedList, 1) end
+    end
+    return true, "Applied: " .. tostring(shownName) .. " (" .. changed .. " slot)", shownName
+end
+
+local function ApplyBundle(id, name, silent, filter)
+    task.spawn(function()
+        if applyBusy then SetStatus("Masih memproses bundle sebelumnya...") return end
+        applyBusy = true
+        local ok, a, b, c = pcall(ApplyBundleSync, id, name, silent, filter)
+        applyBusy = false
+        if not ok then SetStatus("Error: " .. tostring(a)) return end
+        SetStatus(b)
+        if a then AddRecent(id, c or name, "bundle") end
+    end)
+end
+
+local function ReapplyAll()
+    if #appliedList == 0 then return end
+    applyBusy = true
+    local list = appliedList
+    appliedList = {}
+    for _, e in ipairs(list) do
+        pcall(ApplyBundleSync, e.id, e.name, true, e.filter)
+    end
+    applyBusy = false
+end
+
+local function ResetAnimations()
+    local char = GetChar()
+    local animate = char and char:FindFirstChild("Animate")
+    if animate and originals then
+        for anim, aid in pairs(originals) do
+            if anim.Parent then anim.AnimationId = aid end
+        end
+        RefreshAnimate(animate)
+    end
+    appliedList = {}
+    SetStatus("Animasi dikembalikan ke default")
+end
+
+local emoteTrack, currentEmoteId = nil, nil
+local function StopEmote()
+    if emoteTrack then
+        pcall(function()
+            emoteTrack:Stop(0.2)
+            emoteTrack:Destroy()
+        end)
+    end
+    emoteTrack, currentEmoteId = nil, nil
+end
+
+local function PlayEmote(id, name)
+    task.spawn(function()
+        if IsR6() then SetStatus("R6 tidak didukung (emote ini untuk R15)") return end
+        local animator = GetAnimator()
+        if not animator then SetStatus("Karakter tidak ditemukan") return end
+
+        SetStatus("Memuat emote " .. tostring(name or id) .. "...")
+
+        local aid = emoteCache[id]
+        if not aid then
+            local obj = LoadAsset(id)
+            local anim = obj and CollectAnimations(obj)[1]
+            if anim and anim.AnimationId ~= "" then
+                aid = anim.AnimationId
+            else
+                aid = "rbxassetid://" .. id -- fallback: anggap ID langsung adalah animation ID
+            end
+            if obj then pcall(function() obj:Destroy() end) end
+            emoteCache[id] = aid
+        end
+
+        StopEmote()
+        local anim = Create("Animation", { AnimationId = aid })
+        local ok, track = pcall(function() return animator:LoadAnimation(anim) end)
+        if not ok or not track then SetStatus("Gagal load emote") return end
+
+        track.Priority = Enum.AnimationPriority.Action
+        track.Looped = Settings.loop
+        emoteTrack, currentEmoteId = track, id
+        track:Play(0.2)
+        track:AdjustSpeed(Settings.speed)
+        track.Stopped:Connect(function()
+            if emoteTrack == track then emoteTrack, currentEmoteId = nil, nil end
+        end)
+        SetStatus("Emote: " .. tostring(name or id))
+        AddRecent(id, name or ("Emote " .. id), "emote")
+    end)
+end
+
+Track(RunService.Heartbeat:Connect(function()
+    if not (Settings.stopOnMove and emoteTrack) then return end
+    local _, hum = GetChar()
+    if hum and hum.MoveDirection.Magnitude > 0.1 then StopEmote() end
+end))
+
+local function CurrentFilter()
+    if mode == "mix" then return CopyTable(slotsOn) end
+    return nil
+end
+
+local function TriggerItem(item, filter)
+    if item.kind == "emote" then
+        PlayEmote(item.id, item.name)
+    else
+        ApplyBundle(item.id, item.name, false, filter)
+    end
+end
+
+--------------------------------------------------------------------
+-- GEAR PANEL (pengaturan)
+--------------------------------------------------------------------
+GearPanel = Create("ScrollingFrame", {
+    Position = UDim2.new(1, -254, 0, 150),
+    Size = UDim2.fromOffset(240, 300),
+    BackgroundColor3 = Theme.Panel,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    CanvasSize = UDim2.fromOffset(0, 300),
+    Visible = false, ZIndex = 20
+}, Main)
+Create("UICorner", { CornerRadius = UDim.new(0, 8) }, GearPanel)
+Create("UIStroke", { Color = Color3.fromRGB(50, 50, 56), Thickness = 1 }, GearPanel)
+
+local rowY = 10
+local function PanelButton(getText, onClick)
+    local b = Pill(GearPanel, {
+        Position = UDim2.fromOffset(10, rowY), Size = UDim2.new(1, -26, 0, 28),
+        BackgroundColor3 = Theme.Element, Text = "",
+        TextColor3 = Theme.Text, Font = Enum.Font.GothamMedium,
+        TextSize = 10, ZIndex = 21
+    })
+    rowY += 34
+    local function refresh() b.Text = getText() end
+    refresh()
+    b.MouseButton1Click:Connect(function() onClick() refresh() end)
+    return b, refresh
+end
+
+local function OnOff(v) return v and "ON" or "OFF" end
+local function RefetchIfGrid()
+    if not LIST_MODES[mode] then task.spawn(Fetch, false) end
+end
+
+PanelButton(function() return "Loop emote: " .. OnOff(Settings.loop) end,
+    function() Settings.loop = not Settings.loop SaveSettings() end)
+
+PanelButton(function() return "Stop saat bergerak: " .. OnOff(Settings.stopOnMove) end,
+    function() Settings.stopOnMove = not Settings.stopOnMove SaveSettings() end)
+
+-- Tombol hide yang bisa diganti
+local capturing = false
+local bindCapture = nil -- item yang sedang menunggu tombol hotkey
+local refreshHideKey
+local _
+_, refreshHideKey = PanelButton(function()
+    if capturing then return "Tekan tombol... (Esc batal)" end
+    return "Tombol hide: " .. GetHideKey().Name
+end, function()
+    bindCapture = nil
+    capturing = true
+end)
+
+PanelButton(function() return "Ikon bubble: " .. OnOff(Settings.bubble) end,
+    function()
+        Settings.bubble = not Settings.bubble
+        SaveSettings()
+        if not Main.Visible then Bubble.Visible = Settings.bubble end
+    end)
+
+PanelButton(function() return "Urutan: " .. SORTS[Settings.sort][1] end,
+    function()
+        Settings.sort = Settings.sort % #SORTS + 1
+        SaveSettings()
+        RefetchIfGrid()
+    end)
+
+PanelButton(function() return "Item per halaman: " .. PAGES[Settings.page] end,
+    function()
+        Settings.page = Settings.page % #PAGES + 1
+        SaveSettings()
+        RefetchIfGrid()
+    end)
+
+PanelButton(function() return "Auto-load semua: " .. OnOff(Settings.autoAll) end,
+    function()
+        Settings.autoAll = not Settings.autoAll
+        SaveSettings()
+        if Settings.autoAll and cursor and not LIST_MODES[mode] and not loading then
+            task.spawn(Fetch, true)
+        end
+    end)
+
+PanelButton(function() return "Gratis saja: " .. OnOff(Settings.freeOnly) end,
+    function()
+        Settings.freeOnly = not Settings.freeOnly
+        SaveSettings()
+        RefetchIfGrid()
+    end)
+
+PanelButton(function() return "Auto-cek item baru: " .. OnOff(Settings.autoCheck) end,
+    function() Settings.autoCheck = not Settings.autoCheck SaveSettings() end)
+
+PanelButton(function() return "Interval cek: " .. REFRESH_MINUTES[Settings.refresh] .. " menit" end,
+    function()
+        Settings.refresh = Settings.refresh % #REFRESH_MINUTES + 1
+        SaveSettings()
+    end)
+
+PanelButton(function() return "Cek item baru sekarang" end,
+    function()
+        task.spawn(function()
+            SetStatus("Mengecek item baru...")
+            local n = CheckNew()
+            SetStatus(n > 0 and (n .. " item baru! lihat tab NEW") or "Tidak ada item baru")
+        end)
+    end)
+
+PanelButton(function() return "Tandai semua NEW dilihat" end,
+    function()
+        Settings.newItems = {}
+        SaveSettings()
+        RefreshNewBadge()
+        if mode == "new" then ShowList() end
+    end)
+
+PanelButton(function() return "Hapus riwayat RECENT" end,
+    function()
+        Settings.recent = {}
+        SaveSettings()
+        if mode == "recent" then ShowList() end
+    end)
+
+PanelButton(function() return "Reset posisi & ukuran window" end,
+    function()
+        Main.Size = UDim2.fromOffset(640, 560)
+        Main.Position = UDim2.new(0.5, -320, 0.5, -280)
+        Settings.win = nil
+        SaveSettings()
+    end)
+
+Create("TextLabel", {
+    Position = UDim2.fromOffset(14, rowY), Size = UDim2.fromOffset(110, 28),
+    BackgroundTransparency = 1, Text = "Kecepatan emote",
+    TextColor3 = Theme.Text, Font = Enum.Font.GothamMedium, TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 21
+}, GearPanel)
+local SpeedBox = Create("TextBox", {
+    Position = UDim2.new(1, -88, 0, rowY), Size = UDim2.fromOffset(64, 28),
+    BackgroundColor3 = Theme.Element, Text = tostring(Settings.speed),
+    TextColor3 = Theme.Text, Font = Enum.Font.GothamMedium, TextSize = 10,
+    ZIndex = 21
+}, GearPanel)
+Create("UICorner", { CornerRadius = UDim.new(0, 6) }, SpeedBox)
+GearPanel.CanvasSize = UDim2.fromOffset(0, rowY + 40)
+
+SpeedBox.FocusLost:Connect(function()
+    local v = tonumber(SpeedBox.Text)
+    Settings.speed = v and math.clamp(v, 0.1, 5) or 1
+    SpeedBox.Text = tostring(Settings.speed)
+    SaveSettings()
+    if emoteTrack then emoteTrack:AdjustSpeed(Settings.speed) end
+end)
+
+--------------------------------------------------------------------
+-- THUMBNAIL LAZY-LOAD (hanya muat gambar yang terlihat)
+--------------------------------------------------------------------
+local pendingThumbs = {}
+local thumbQueued = false
+
+local function RegisterThumb(img, url)
+    table.insert(pendingThumbs, { img = img, url = url })
+end
+
+local function LoadVisibleThumbs()
+    if #pendingThumbs == 0 then return end
+    local top = Grid.AbsolutePosition.Y
+    local bottom = top + Grid.AbsoluteSize.Y
+    for i = #pendingThumbs, 1, -1 do
+        local t = pendingThumbs[i]
+        if not t.img.Parent then
+            table.remove(pendingThumbs, i)
+        else
+            local y = t.img.AbsolutePosition.Y
+            if y + 110 >= top - 350 and y <= bottom + 350 then
+                t.img.Image = t.url
+                table.remove(pendingThumbs, i)
+            end
+        end
+    end
+end
+
+function QueueThumbs()
+    if thumbQueued then return end
+    thumbQueued = true
+    task.delay(0.12, function()
+        thumbQueued = false
+        if alive then LoadVisibleThumbs() end
+    end)
+end
+
+Track(Grid:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+    UpdateCells()
+    QueueThumbs()
+end))
+
+--------------------------------------------------------------------
+-- GRID / CARDS
+--------------------------------------------------------------------
+local function ClearGrid()
+    for _, c in ipairs(Grid:GetChildren()) do
+        if c:IsA("Frame") then c:Destroy() end
+    end
+    pendingThumbs = {}
+    Grid.CanvasPosition = Vector2.zero
+end
+
+local function SmallBtn(parent, x, w, text, z)
+    local b = Create("TextButton", {
+        Position = UDim2.new(1, x, 0, 10),
+        Size = UDim2.fromOffset(w, 16),
+        BackgroundColor3 = Theme.Dark,
+        BackgroundTransparency = 0.35,
+        Text = text, TextColor3 = Theme.Text,
+        Font = Enum.Font.GothamBold, TextSize = 9,
+        AutoButtonColor = false, ZIndex = z or 3
+    }, parent)
+    Create("UICorner", { CornerRadius = UDim.new(0, 4) }, b)
+    return b
+end
+
+local function MakeCard(item, kind)
+    orderCounter += 1
+    local favKey = kind .. ":" .. item.id
+
+    local card = Create("Frame", {
+        BackgroundColor3 = Theme.Panel,
+        BorderSizePixel = 0,
+        LayoutOrder = orderCounter
+    }, Grid)
+    Create("UICorner", { CornerRadius = UDim.new(0, 8) }, card)
+
+    local thumbType = (kind == "emote") and "Asset" or "BundleThumbnail"
+    local img = Create("ImageLabel", {
+        Position = UDim2.fromOffset(6, 6),
+        Size = UDim2.new(1, -12, 0, 100),
+        BackgroundColor3 = Theme.Dark,
+        BorderSizePixel = 0,
+        Image = "",
+        ScaleType = Enum.ScaleType.Fit
+    }, card)
+    Create("UICorner", { CornerRadius = UDim.new(0, 6) }, img)
+    RegisterThumb(img, string.format("rbxthumb://type=%s&id=%d&w=150&h=150", thumbType, item.id))
+
+    -- label harga
+    if item.price ~= nil then
+        local pt = (item.price == 0) and "FREE" or ("R$ " .. tostring(item.price))
+        Create("TextLabel", {
+            Position = UDim2.fromOffset(10, 88), Size = UDim2.fromOffset(#pt * 6 + 10, 14),
+            BackgroundColor3 = Theme.Dark, BackgroundTransparency = 0.3,
+            Text = pt, TextColor3 = (item.price == 0) and Theme.Gold or Theme.Text,
+            Font = Enum.Font.GothamBold, TextSize = 8, ZIndex = 3
+        }, card)
+    end
+
+    local nameBg = Create("Frame", {
+        Position = UDim2.fromOffset(6, 112),
+        Size = UDim2.new(1, -12, 0, 40),
+        BackgroundColor3 = Theme.Element,
+        BorderSizePixel = 0
+    }, card)
+    Create("UICorner", { CornerRadius = UDim.new(0, 5) }, nameBg)
+    Create("TextLabel", {
+        Size = UDim2.new(1, -8, 1, 0),
+        Position = UDim2.fromOffset(4, 0),
+        BackgroundTransparency = 1,
+        Text = string.upper(item.name or "?"),
+        TextColor3 = Theme.Text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 9,
+        TextWrapped = true,
+        TextTruncate = Enum.TextTruncate.AtEnd
+    }, nameBg)
+
+    -- badge NEW
+    local badge = Create("TextLabel", {
+        Position = UDim2.fromOffset(10, 10), Size = UDim2.fromOffset(30, 14),
+        BackgroundColor3 = Theme.White, Text = "NEW", TextColor3 = Theme.Dark,
+        Font = Enum.Font.GothamBold, TextSize = 8, ZIndex = 3,
+        Visible = Settings.newItems[favKey] ~= nil
+    }, card)
+    Create("UICorner", { CornerRadius = UDim.new(0, 4) }, badge)
+
+    local function ClearNew()
+        if Settings.newItems[favKey] then
+            Settings.newItems[favKey] = nil
+            SaveSettings()
+            RefreshNewBadge()
+        end
+        badge.Visible = false
+        if mode == "new" then
+            card:Destroy()
+            UpdateFooter()
+        end
+    end
+
+    local hit = Create("TextButton", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = "", ZIndex = 2
+    }, card)
+    hit.MouseButton1Click:Connect(function()
+        local entry = { id = item.id, name = item.name, kind = kind }
+        local f = CurrentFilter()
+        ClearNew()
+        TriggerItem(entry, f)
+    end)
+
+    -- ⌨ bind hotkey
+    local bindBtn = SmallBtn(card, -80, 22, "⌨")
+    bindBtn.MouseButton1Click:Connect(function()
+        capturing = false
+        bindCapture = { id = item.id, name = item.name, kind = kind, filter = CurrentFilter() }
+        SetStatus("Tekan tombol untuk di-bind ke " .. tostring(item.name) .. " (Esc batal)")
+    end)
+
+    -- ID (salin + isi kolom)
+    local idBtn = SmallBtn(card, -54, 24, "ID")
+    idBtn.MouseButton1Click:Connect(function()
+        IdBox.Text = tostring(item.id)
+        if clipboardFn then
+            pcall(clipboardFn, tostring(item.id))
+            SetStatus("ID " .. item.id .. " disalin")
+        else
+            SetStatus("ID " .. item.id .. " dimasukkan ke kolom ID")
+        end
+    end)
+
+    local star = Create("TextButton", {
+        Position = UDim2.new(1, -28, 0, 8),
+        Size = UDim2.fromOffset(20, 20),
+        BackgroundTransparency = 1,
+        Text = Settings.favs[favKey] and "★" or "☆",
+        TextColor3 = Settings.favs[favKey] and Theme.Gold or Theme.Text,
+        Font = Enum.Font.GothamBold, TextSize = 13, ZIndex = 3
+    }, card)
+    star.MouseButton1Click:Connect(function()
+        if Settings.favs[favKey] then
+            Settings.favs[favKey] = nil
+        else
+            Settings.favs[favKey] = { id = item.id, name = item.name, kind = kind }
+        end
+        star.Text = Settings.favs[favKey] and "★" or "☆"
+        star.TextColor3 = Settings.favs[favKey] and Theme.Gold or Theme.Text
+        SaveSettings()
+        if mode == "favs" then
+            card:Destroy()
+            UpdateFooter()
+        end
+    end)
+end
+
+local function MakeBindCard(keyName, item)
+    orderCounter += 1
+    local card = Create("Frame", {
+        BackgroundColor3 = Theme.Panel,
+        BorderSizePixel = 0,
+        LayoutOrder = orderCounter
+    }, Grid)
+    Create("UICorner", { CornerRadius = UDim.new(0, 8) }, card)
+
+    local keyBox = Create("TextLabel", {
+        Position = UDim2.fromOffset(6, 6),
+        Size = UDim2.new(1, -12, 0, 100),
+        BackgroundColor3 = Theme.Dark,
+        Text = keyName, TextColor3 = Theme.White,
+        Font = Enum.Font.GothamBold, TextSize = 18, TextWrapped = true
+    }, card)
+    Create("UICorner", { CornerRadius = UDim.new(0, 6) }, keyBox)
+    Create("TextLabel", {
+        Position = UDim2.new(0, 10, 1, -158 + 88), Size = UDim2.fromOffset(60, 14),
+        BackgroundTransparency = 1, Text = string.upper(item.kind or "bundle"),
+        TextColor3 = Theme.Muted, Font = Enum.Font.GothamBold, TextSize = 8,
+        TextXAlignment = Enum.TextXAlignment.Left, ZIndex = 3
+    }, card)
+
+    local nameBg = Create("Frame", {
+        Position = UDim2.fromOffset(6, 112),
+        Size = UDim2.new(1, -12, 0, 40),
+        BackgroundColor3 = Theme.Element,
+        BorderSizePixel = 0
+    }, card)
+    Create("UICorner", { CornerRadius = UDim.new(0, 5) }, nameBg)
+    Create("TextLabel", {
+        Size = UDim2.new(1, -8, 1, 0), Position = UDim2.fromOffset(4, 0),
+        BackgroundTransparency = 1,
+        Text = string.upper(item.name or "?"),
+        TextColor3 = Theme.Text, Font = Enum.Font.GothamBold,
+        TextSize = 9, TextWrapped = true, TextTruncate = Enum.TextTruncate.AtEnd
+    }, nameBg)
+
+    local hit = Create("TextButton", {
+        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", ZIndex = 2
+    }, card)
+    hit.MouseButton1Click:Connect(function() TriggerItem(item, item.filter) end)
+
+    local del = SmallBtn(card, -28, 20, "✕")
+    del.Position = UDim2.new(1, -28, 0, 10)
+    del.MouseButton1Click:Connect(function()
+        Settings.binds[keyName] = nil
+        SaveSettings()
+        card:Destroy()
+        UpdateFooter()
+    end)
+end
+
+function ShowList()
+    fetchGen += 1 -- batalkan fetch/auto-load yang sedang jalan
+    loading = false
+    ClearGrid()
+    cursor = nil
+    local q = string.lower(SearchBox.Text or "")
+    local items = {}
+
+    local function matches(name)
+        return q == "" or string.find(string.lower(name or ""), q, 1, true) ~= nil
+    end
+
+    if mode == "keys" then
+        local keys = {}
+        for k, b in pairs(Settings.binds) do
+            if matches(b.name) or string.find(string.lower(k), q, 1, true) then
+                table.insert(keys, k)
+            end
+        end
+        table.sort(keys)
+        for _, k in ipairs(keys) do MakeBindCard(k, Settings.binds[k]) end
+        count = #keys
+    else
+        if mode == "favs" then
+            for _, f in pairs(Settings.favs) do table.insert(items, f) end
+            table.sort(items, function(a, b) return (a.name or "") < (b.name or "") end)
+        elseif mode == "recent" then
+            for _, f in ipairs(Settings.recent) do table.insert(items, f) end
+        elseif mode == "new" then
+            for _, f in pairs(Settings.newItems) do table.insert(items, f) end
+            table.sort(items, function(a, b) return (a.name or "") < (b.name or "") end)
+        end
+        local n = 0
+        for _, f in ipairs(items) do
+            if matches(f.name) then
+                MakeCard({ id = f.id, name = f.name }, f.kind or "bundle")
+                n += 1
+            end
+        end
+        count = n
+    end
+    UpdateFooter()
+    QueueThumbs()
+end
+
+--------------------------------------------------------------------
+-- KATALOG: HTTP + AvatarEditorService
+--------------------------------------------------------------------
+local function HttpPage(kind, keyword, sortIdx, limit, cursorIn)
+    local base = (kind == "emote") and EMOTE_QUERY or BUNDLE_QUERY
+    local path = string.format("%s?%s&Limit=%d&SortType=%d", CATALOG_PATH, base, limit, SORTS[sortIdx][2])
+    if keyword and keyword ~= "" then path = path .. "&Keyword=" .. HttpService:UrlEncode(keyword) end
+    if cursorIn then path = path .. "&cursor=" .. HttpService:UrlEncode(cursorIn) end
+
+    local data = CatalogGet(path)
+    if not data or not data.data then return nil end
+
+    local items = {}
+    for _, it in ipairs(data.data) do
+        if it.id then
+            local price = it.price
+            if price == nil and it.priceStatus == "Free" then price = 0 end
+            table.insert(items, { id = it.id, name = it.name, price = price })
+        end
+    end
+    return items, data.nextPageCursor
+end
+
+-- jalur cadangan tanpa HTTP: AvatarEditorService:SearchCatalog
+local function AESearch(holder, kind, keyword, sortIdx, limit, continue)
+    local ok = pcall(function()
+        if continue and holder.pages then
+            holder.pages:AdvanceToNextPageAsync()
+        else
+            local params = CatalogSearchParams.new()
+            params.SearchKeyword = keyword or ""
+            if kind == "emote" then
+                params.AssetTypes = { Enum.AvatarAssetType.EmoteAnimation }
+            else
+                params.BundleTypes = { Enum.BundleType.Animations }
+            end
+            pcall(function() params.SortType = Enum.CatalogSortType[AE_SORT_NAMES[sortIdx]] end)
+            pcall(function() params.Limit = limit end)
+            holder.pages = AvatarEditorService:SearchCatalog(params)
+        end
+    end)
+    if not ok or not holder.pages then return nil end
+
+    local okp, page = pcall(function() return holder.pages:GetCurrentPage() end)
+    if not okp or type(page) ~= "table" then return nil end
+    local items = {}
+    for _, it in ipairs(page) do
+        if it.Id then table.insert(items, { id = it.Id, name = it.Name, price = it.Price }) end
+    end
+    return items, not holder.pages.IsFinished
+end
+
+local function PassFilter(it)
+    if Settings.freeOnly then return it.price == 0 end
+    return true
+end
+
+function Fetch(append)
+    if LIST_MODES[mode] then return end
+
+    local gen
+    if append then
+        if loading or not cursor then return end
+        gen = fetchGen
+    else
+        fetchGen += 1
+        gen = fetchGen
+        cursor = nil
+        count = 0
+        pageCount = 0
+        seen = {}
+        ClearGrid()
+    end
+    loading = true
+
+    local kind = (mode == "emotes") and "emote" or "bundle"
+    local q = SearchBox.Text or ""
+    local limit = PAGES[Settings.page]
+    local sortIdx = Settings.sort
+    if not append then lastQueryKey = kind .. ":" .. q end
+
+    Footer.Text = "Loading..."
+    local items, nextCursor
+
+    if not (append and source == "ae") then
+        local its, nc = HttpPage(kind, q, sortIdx, limit, (append and source == "http") and cursor or nil)
+        if its then
+            source = "http"
+            items, nextCursor = its, nc
+        end
+    end
+    if not items then
+        local its, more = AESearch(gridAE, kind, q, sortIdx, limit, append and source == "ae")
+        if its then
+            source = "ae"
+            items = its
+            nextCursor = more and "AE" or nil
+        end
+    end
+
+    if gen ~= fetchGen then return end -- hasil usang, abaikan
+    loading = false
+
+    if not items then
+        cursor = nil
+        Footer.Text = "Gagal load katalog (HTTP & AvatarEditorService tidak tersedia). Pakai kolom ID + APPLY."
+        return
+    end
+
+    for _, it in ipairs(items) do
+        if it.id and not seen[it.id] then
+            seen[it.id] = true
+            if PassFilter(it) then
+                MakeCard(it, kind)
+                count += 1
+            end
+        end
+    end
+    cursor = nextCursor
+    pageCount += 1
+    UpdateFooter()
+    QueueThumbs()
+
+    -- lanjut otomatis (auto-load semua, atau filter gratis yang hasilnya masih sedikit)
+    local wantMore = Settings.autoAll or (Settings.freeOnly and count < 12)
+    if wantMore and cursor and pageCount < MAX_AUTO_PAGES then
+        task.wait(0.35)
+        if alive and gen == fetchGen and not LIST_MODES[mode] then Fetch(true) end
+    end
+end
+
+Track(Grid:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+    QueueThumbs()
+    if LIST_MODES[mode] or loading or not cursor then return end
+    if Grid.CanvasPosition.Y + Grid.AbsoluteWindowSize.Y >= Grid.AbsoluteCanvasSize.Y - 40 then
+        Fetch(true)
+    end
+end))
+
+--------------------------------------------------------------------
+-- CEK ITEM BARU (marketplace)
+--------------------------------------------------------------------
+function CheckNew()
+    local added = 0
+    for _, kind in ipairs({ "bundle", "emote" }) do
+        local its = HttpPage(kind, "", NEWEST_SORT, 30, nil)
+        if not its then its = AESearch({}, kind, "", NEWEST_SORT, 30, false) end
+
+        if its and #its > 0 then
+            local prev = Settings.latest[kind]
+            local prevSet = {}
+            if prev then
+                for _, pid in ipairs(prev) do prevSet[pid] = true end
+                for _, it in ipairs(its) do
+                    if it.id and not prevSet[it.id] then
+                        local key = kind .. ":" .. it.id
+                        if not Settings.newItems[key] then
+                            Settings.newItems[key] = { id = it.id, name = it.name, kind = kind }
+                            added += 1
+                        end
+                    end
+                end
+            end
+            -- gabung daftar id yang sudah pernah terlihat (maks 400)
+            local merged, mset = {}, {}
+            for _, it in ipairs(its) do
+                if it.id and not mset[it.id] then mset[it.id] = true table.insert(merged, it.id) end
+            end
+            if prev then
+                for _, pid in ipairs(prev) do
+                    if #merged >= 400 then break end
+                    if not mset[pid] then mset[pid] = true table.insert(merged, pid) end
+                end
+            end
+            Settings.latest[kind] = merged
+        end
+    end
+    SaveSettings()
+    RefreshNewBadge()
+    if mode == "new" then ShowList() end
+    return added
+end
+
+task.spawn(function()
+    task.wait(3)
+    local waited = 0
+    local first = true
+    while alive do
+        if Settings.autoCheck and (first or waited >= REFRESH_MINUTES[Settings.refresh] * 60) then
+            first, waited = false, 0
+            local ok, n = pcall(CheckNew)
+            if ok and n and n > 0 then SetStatus(n .. " item baru di marketplace! (tab NEW)") end
+        end
+        task.wait(5)
+        waited += 5
+    end
+end)
+
+--------------------------------------------------------------------
+-- TAB LOGIC
+--------------------------------------------------------------------
+local function Layout()
+    local top = (mode == "mix") and 198 or 166
+    Chips.Visible = (mode == "mix")
+    Grid.Position = UDim2.fromOffset(0, top)
+    Grid.Size = UDim2.new(1, 0, 1, -top)
+end
+
+local function UpdateTabColors(m, animated)
+    for name, btn in pairs(TabButtons) do
+        local active = (name == m)
+        local props = {
+            BackgroundColor3 = active and Theme.White or Theme.Element,
+            TextColor3 = active and Theme.Dark or Theme.Text
+        }
+        if animated then
+            TweenService:Create(btn, TweenInfo.new(0.15), props):Play()
+        else
+            btn.BackgroundColor3 = props.BackgroundColor3
+            btn.TextColor3 = props.TextColor3
+        end
+    end
+end
+
+local function SetMode(m)
+    mode = m
+    UpdateTabColors(m, true)
+    Layout()
+    GearPanel.Visible = false
+
+    if m == "emotes" then
+        SearchBox.PlaceholderText = "Search emotes — dance, wave..."
+    elseif LIST_MODES[m] then
+        SearchBox.PlaceholderText = "Filter daftar ini..."
+    else
+        SearchBox.PlaceholderText = "Search animation packs — ninja, zombie..."
+    end
+
+    if LIST_MODES[m] then
+        ShowList()
+    else
+        task.spawn(Fetch, false)
+    end
+end
+
+for name, btn in pairs(TabButtons) do
+    btn.MouseButton1Click:Connect(function()
+        if mode == name then return end
+        -- bundles <-> mix berbagi daftar yang sama
+        local sameList = (mode == "bundles" and name == "mix") or (mode == "mix" and name == "bundles")
+        if sameList then
+            mode = name
+            UpdateTabColors(name, false)
+            Layout()
+            QueueThumbs()
+        else
+            SetMode(name)
+        end
+    end)
+end
+
+local function DoSearch(force)
+    if LIST_MODES[mode] then
+        ShowList()
+        return
+    end
+    local kind = (mode == "emotes") and "emote" or "bundle"
+    local key = kind .. ":" .. (SearchBox.Text or "")
+    if not force and key == lastQueryKey then return end
+    task.spawn(Fetch, false)
+end
+SearchBtn.MouseButton1Click:Connect(function() DoSearch(true) end)
+SearchBox.FocusLost:Connect(function(enter) if enter then DoSearch(true) end end)
+
+-- pencarian otomatis saat mengetik (debounce)
+Track(SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    searchToken += 1
+    local my = searchToken
+    task.delay(0.7, function()
+        if alive and my == searchToken then DoSearch(false) end
+    end)
+end))
+
+local function ParseId(text)
+    text = tostring(text or "")
+    local id = string.match(text, "bundles/(%d+)") or string.match(text, "catalog/(%d+)") or string.match(text, "(%d+)")
+    return id and tonumber(id) or nil
+end
+
+local function DoApply()
+    local id = ParseId(IdBox.Text)
+    if not id then SetStatus("ID / link tidak valid") return end
+    if mode == "emotes" then
+        PlayEmote(id)
+    else
+        ApplyBundle(id, nil, false, CurrentFilter())
+    end
+end
+ApplyBtn.MouseButton1Click:Connect(DoApply)
+IdBox.FocusLost:Connect(function(enter) if enter then DoApply() end end)
+
+GearBtn.MouseButton1Click:Connect(function()
+    GearPanel.Visible = not GearPanel.Visible
+    if GearPanel.Visible then
+        local maxH = Main.AbsoluteSize.Y - 190
+        GearPanel.Size = UDim2.fromOffset(240, math.clamp(maxH, 120, 330))
+    end
+end)
+StopBtn.MouseButton1Click:Connect(function() StopEmote() SetStatus("Emote dihentikan") end)
+ResetBtn.MouseButton1Click:Connect(function() StopEmote() ResetAnimations() end)
+
+--------------------------------------------------------------------
+-- RESPAWN, INPUT (hide key + hotkey), CLOSE
+--------------------------------------------------------------------
+Track(Player.CharacterAdded:Connect(function(char)
+    StopEmote()
+    originals = nil
+    char:WaitForChild("Humanoid")
+    char:WaitForChild("Animate", 10)
+    task.wait(0.6)
+    ReapplyAll()
+end))
+
+Track(UIS.InputBegan:Connect(function(input, gp)
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    -- merekam tombol hide baru
+    if capturing then
+        capturing = false
+        if input.KeyCode ~= Enum.KeyCode.Escape and input.KeyCode ~= Enum.KeyCode.Unknown then
+            Settings.hideKey = input.KeyCode.Name
+            SaveSettings()
+            SetStatus("Tombol hide diganti ke " .. input.KeyCode.Name)
+        end
+        refreshHideKey()
+        return
+    end
+
+    -- merekam tombol hotkey item
+    if bindCapture then
+        local item = bindCapture
+        bindCapture = nil
+        if input.KeyCode == Enum.KeyCode.Escape or input.KeyCode == Enum.KeyCode.Unknown then
+            SetStatus("Bind dibatalkan")
+        elseif input.KeyCode == GetHideKey() then
+            SetStatus("Tombol itu dipakai untuk hide GUI, pilih tombol lain")
+        else
+            Settings.binds[input.KeyCode.Name] = item
+            SaveSettings()
+            SetStatus(input.KeyCode.Name .. " → " .. tostring(item.name))
+            if mode == "keys" then ShowList() end
+        end
+        return
+    end
+
+    if UIS:GetFocusedTextBox() then return end
+
+    if input.KeyCode == GetHideKey() then
+        ToggleHidden()
+        return
+    end
+
+    if gp then return end
+    local b = Settings.binds[input.KeyCode.Name]
+    if b then
+        if b.kind == "emote" and emoteTrack and currentEmoteId == b.id then
+            StopEmote() -- tekan lagi = stop
+        else
+            TriggerItem(b, b.filter)
+        end
+    end
+end))
+
+CloseBtn.MouseButton1Click:Connect(function()
+    alive = false
+    StopEmote()
+    ResetAnimations()
+    for _, c in ipairs(Connections) do c:Disconnect() end
+    Gui:Destroy()
+end)
+
+SetMode("bundles")
+print("RizKuril Bundle Animations v3 loaded! Hide key: " .. GetHideKey().Name)
